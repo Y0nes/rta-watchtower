@@ -3,8 +3,14 @@ import { differenceInMinutes, parseISO } from 'date-fns';
 
 // --- CONFIGURATION ---
 const THRESHOLDS = {
-    WAIT_TIME_BREACH: 30, // Minutes (Customize this)
-    HANDLE_TIME_BREACH: 20 // Minutes (Customize this)
+    WAIT_TIME_BREACH: 30, // Minutes
+    HANDLE_TIME_BREACH: 20 // Minutes
+};
+
+// Messaging Channels vs Email/Web Channels
+const CHANNELS = {
+    MESSAGING: ['native_messaging', 'chat', 'facebook', 'twitter', 'line', 'whatsapp', 'instagram_direct'],
+    // Everything else falls into Email/Web usually
 };
 
 // --- TYPES ---
@@ -16,15 +22,28 @@ export interface Ticket {
     group_id: number | null;
     created_at: string;
     updated_at: string;
+    via: {
+        channel: string;
+    };
+}
+
+export interface AgentStatus {
+    online: number;
+    working: number;
 }
 
 export interface GroupMetric {
     id: number;
     name: string;
-    longestWait: number; // Minutes
-    longestAHT: number;  // Minutes
-    newTickets: number;
-    openTickets: number;
+    // Wait Times
+    longestEmailWait: number;
+    longestMsgWait: number;
+    // Handle Times
+    longestEmailAHT: number;
+    longestMsgAHT: number;
+    // Counts
+    newTickets: number;     // New & Unassigned
+    openTickets: number;    // Open (Assigned or Unassigned)
     pendingTickets: number;
     breachedTickets: number;
 }
@@ -37,6 +56,7 @@ export interface DashboardMetrics {
     pendingCount: number;
     breachedWaitCount: number;
     breachedHandleCount: number;
+    agents: AgentStatus;
     groups: GroupMetric[];
 }
 
@@ -44,20 +64,56 @@ export interface DashboardMetrics {
 export const fetchTicketData = async (): Promise<DashboardMetrics> => {
     if (!client) throw new Error("ZAF Client not initialized");
 
-    // 1. Fetch Groups (to map IDs to Names)
-    const groupsResponse: any = await client.request('/api/v2/groups.json');
-    // We strictly tell Map that it holds <ID, Name>
-    const groupMap = new Map<number, string>(
-        groupsResponse.groups.map((g: any) => [g.id, g.name])
-    );
+    // 1. Fetch ALL Groups first (to ensure static list)
+    const groupsResponse: any = await client.request('/api/v2/groups.json?per_page=100');
+    const groupMap = new Map<number, GroupMetric>();
 
-    // 2. Fetch Active Tickets (New, Open, Pending)
-    // We use search to get everything in one go. Max 100 per page (we'll fetch 1 page for speed in V1)
-    const searchResponse: any = await client.request('/api/v2/search.json?query=type:ticket status<solved sort:created_at_asc');
-    const tickets: Ticket[] = searchResponse.results;
+    // Initialize every group with 0 data
+    groupsResponse.groups.forEach((g: any) => {
+        groupMap.set(g.id, {
+            id: g.id,
+            name: g.name,
+            longestEmailWait: 0,
+            longestMsgWait: 0,
+            longestEmailAHT: 0,
+            longestMsgAHT: 0,
+            newTickets: 0,
+            openTickets: 0,
+            pendingTickets: 0,
+            breachedTickets: 0
+        });
+    });
 
-    // --- CALCULATION ENGINE ---
+    // 2. Fetch Tickets (Pagination Loop)
+    let allTickets: Ticket[] = [];
+    let url = '/api/v2/search.json?query=type:ticket status<solved sort:created_at_asc&per_page=100';
+    let pages = 0;
+
+    // Safety Cap: Fetch max 10 pages (1000 tickets) to prevent browser freeze. 
+    // Increase 'pages < 10' if you have huge volume.
+    while (url && pages < 10) {
+        const response: any = await client.request(url);
+        allTickets = [...allTickets, ...response.results];
+        url = response.next_page; // Get next page URL
+        pages++;
+    }
+
+    // 3. Fetch Agents
+    let agentStats = { online: 0, working: 0 };
+    try {
+        const agentsResponse: any = await client.request('/api/v2/unified_agent_status');
+        if (agentsResponse && agentsResponse.agent_statuses) {
+            const allAgents = Object.values(agentsResponse.agent_statuses) as any[];
+            agentStats.online = allAgents.filter(a => a.status === 'online').length;
+            agentStats.working = allAgents.filter(a => a.status !== 'offline').length;
+        }
+    } catch (e) {
+        console.warn("Agent API error (Ignore if you don't have Omni-channel):", e);
+    }
+
+    // --- METRICS ENGINE ---
     const now = new Date();
+
     const metrics: DashboardMetrics = {
         longestWait: { time: 0, ticketId: 0 },
         longestHandle: { time: 0, ticketId: 0 },
@@ -66,83 +122,74 @@ export const fetchTicketData = async (): Promise<DashboardMetrics> => {
         pendingCount: 0,
         breachedWaitCount: 0,
         breachedHandleCount: 0,
-        groups: []
+        agents: agentStats,
+        groups: [] // Will be filled from map
     };
 
-    const groupData = new Map<number, GroupMetric>();
+    allTickets.forEach(t => {
+        // If ticket belongs to a deleted group, skip or add to "Unknown"
+        const gId = t.group_id || 0;
+        if (!groupMap.has(gId)) return;
 
-    tickets.forEach(t => {
+        const gMetric = groupMap.get(gId)!;
+
         const created = parseISO(t.created_at);
-        const updated = parseISO(t.updated_at); // Using updated_at as proxy for "Assignment/Last Action"
+        const updated = parseISO(t.updated_at);
         const waitTime = differenceInMinutes(now, created);
         const handleTime = differenceInMinutes(now, updated);
+        const channel = t.via.channel;
+        const isMessaging = CHANNELS.MESSAGING.includes(channel);
 
-        // Initialize Group Data if missing
-        const gId = t.group_id || 0;
-        if (!groupData.has(gId)) {
-            groupData.set(gId, {
-                id: gId,
-                name: groupMap.get(gId) || "No Group",
-                longestWait: 0,
-                longestAHT: 0,
-                newTickets: 0,
-                openTickets: 0,
-                pendingTickets: 0,
-                breachedTickets: 0
-            });
-        }
-        const gMetric = groupData.get(gId)!;
-
-        // --- KPI 1: Longest Wait (Status = New & Unassigned) ---
+        // --- KPI 1: New & Unassigned ---
         if (t.status === 'new' && t.assignee_id === null) {
             metrics.newCount++;
             gMetric.newTickets++;
 
-            if (waitTime > metrics.longestWait.time) {
-                metrics.longestWait = { time: waitTime, ticketId: t.id };
+            // Wait Time Calculations
+            if (waitTime > metrics.longestWait.time) metrics.longestWait = { time: waitTime, ticketId: t.id };
+
+            if (isMessaging) {
+                if (waitTime > gMetric.longestMsgWait) gMetric.longestMsgWait = waitTime;
+            } else {
+                if (waitTime > gMetric.longestEmailWait) gMetric.longestEmailWait = waitTime;
             }
-            if (waitTime > gMetric.longestWait) {
-                gMetric.longestWait = waitTime;
+
+            // Breach Check (Wait)
+            if (waitTime > THRESHOLDS.WAIT_TIME_BREACH) {
+                metrics.breachedWaitCount++;
+                gMetric.breachedTickets++;
             }
         }
 
-        // --- KPI 2: Longest Handle (Status = Open & Assigned) ---
-        // User Requirement: "Assignee != 0" (Assigned)
+        // --- KPI 2: Open (Any Open ticket) ---
         if (t.status === 'open') {
-            metrics.openCount++; // User point 4: Countif(status = open)
+            metrics.openCount++;
             gMetric.openTickets++;
 
-            if (t.assignee_id !== null) {
-                if (handleTime > metrics.longestHandle.time) {
-                    metrics.longestHandle = { time: handleTime, ticketId: t.id };
-                }
-                if (handleTime > gMetric.longestAHT) {
-                    gMetric.longestAHT = handleTime;
-                }
+            // Handle Time Calculations (Only if assigned usually, but checking all Open)
+            if (handleTime > metrics.longestHandle.time) metrics.longestHandle = { time: handleTime, ticketId: t.id };
+
+            if (isMessaging) {
+                if (handleTime > gMetric.longestMsgAHT) gMetric.longestMsgAHT = handleTime;
+            } else {
+                if (handleTime > gMetric.longestEmailAHT) gMetric.longestEmailAHT = handleTime;
+            }
+
+            // Breach Check (Handle)
+            if (handleTime > THRESHOLDS.HANDLE_TIME_BREACH) {
+                metrics.breachedHandleCount++;
+                gMetric.breachedTickets++;
             }
         }
 
-        // --- KPI: Pending ---
+        // --- KPI 3: Pending ---
         if (t.status === 'pending') {
             metrics.pendingCount++;
             gMetric.pendingTickets++;
         }
-
-        // --- KPI 5 & 6: Breaches ---
-        // Wait Time Breach (Applies to New tickets)
-        if (t.status === 'new' && waitTime > THRESHOLDS.WAIT_TIME_BREACH) {
-            metrics.breachedWaitCount++;
-            gMetric.breachedTickets++;
-        }
-        // Handle Time Breach (Applies to Open tickets)
-        if (t.status === 'open' && handleTime > THRESHOLDS.HANDLE_TIME_BREACH) {
-            metrics.breachedHandleCount++;
-            gMetric.breachedTickets++;
-        }
     });
 
-    // Convert Map to Array for the Table
-    metrics.groups = Array.from(groupData.values()).sort((a, b) => b.longestWait - a.longestWait);
-
+    // Convert Map back to Array
+    metrics.groups = Array.from(groupMap.values());
     return metrics;
 };
