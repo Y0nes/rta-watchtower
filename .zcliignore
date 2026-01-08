@@ -1,0 +1,18 @@
+# Exclude development dependencies and source code
+node_modules/
+**/node_modules/
+src/
+tmp/
+.git/
+.gitignore
+package.json
+package-lock.json
+tsconfig.json
+vite.config.ts
+tailwind.config.js
+postcss.config.js
+README.md
+dist/
+build/
+.vscode/
+.idea/

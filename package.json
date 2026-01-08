@@ -5,7 +5,9 @@
     "scripts": {
         "dev": "vite",
         "build": "vite build",
-        "preview": "vite preview"
+        "preview": "vite preview",
+        "zcli:validate": "powershell -Command \"if (Test-Path dist_app) { Remove-Item dist_app -Recurse -Force }; mkdir dist_app -Force; Copy-Item assets, translations, manifest.json dist_app -Recurse -Force; zcli apps:validate dist_app; Remove-Item dist_app -Recurse -Force\"",
+        "zcli:package": "powershell -Command \"if (Test-Path dist_app) { Remove-Item dist_app -Recurse -Force }; mkdir dist_app -Force; Copy-Item assets, translations, manifest.json dist_app -Recurse -Force; zcli apps:package dist_app; if (!(Test-Path tmp)) { mkdir tmp }; Move-Item dist_app/tmp/*.zip tmp/ -Force; Remove-Item dist_app -Recurse -Force; Write-Host 'Package created in ./tmp folder' -ForegroundColor Green\""
     },
     "dependencies": {
         "@radix-ui/react-dialog": "^1.1.15",

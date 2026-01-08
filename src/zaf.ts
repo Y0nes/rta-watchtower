@@ -1,4 +1,4 @@
-// Define that Window can have ZAFClient
+// src/zaf.ts
 declare global {
     interface Window {
         ZAFClient: any;
@@ -13,17 +13,14 @@ if (typeof window.ZAFClient !== 'undefined') {
 
 export { client };
 
-// src/zaf.ts
-// ... existing imports
-
 export const openModal = () => {
     if (!client) return;
     client.invoke('instances.create', {
         location: 'modal',
         url: 'assets/index.html?mode=modal',
         size: {
-            width: '1250px', // <--- Increased Width
-            height: '1100px' // <--- Increased Height
+            width: '1600px', // <--- Widened to fit table comfortably
+            height: '1000px'
         }
     });
 };
