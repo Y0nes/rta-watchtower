@@ -7,10 +7,8 @@ const THRESHOLDS = {
     HANDLE_TIME_BREACH: 20 // Minutes
 };
 
-// Messaging Channels vs Email/Web Channels
 const CHANNELS = {
     MESSAGING: ['native_messaging', 'chat', 'facebook', 'twitter', 'line', 'whatsapp', 'instagram_direct'],
-    // Everything else falls into Email/Web usually
 };
 
 // --- TYPES ---
@@ -29,21 +27,18 @@ export interface Ticket {
 
 export interface AgentStatus {
     online: number;
-    working: number;
+    working: number; // Represents Total Active Agents if Status API fails
 }
 
 export interface GroupMetric {
     id: number;
     name: string;
-    // Wait Times
     longestEmailWait: number;
     longestMsgWait: number;
-    // Handle Times
     longestEmailAHT: number;
     longestMsgAHT: number;
-    // Counts
-    newTickets: number;     // New & Unassigned
-    openTickets: number;    // Open (Assigned or Unassigned)
+    newTickets: number;
+    openTickets: number;
     pendingTickets: number;
     breachedTickets: number;
 }
@@ -64,11 +59,10 @@ export interface DashboardMetrics {
 export const fetchTicketData = async (): Promise<DashboardMetrics> => {
     if (!client) throw new Error("ZAF Client not initialized");
 
-    // 1. Fetch ALL Groups first (to ensure static list)
+    // 1. Fetch ALL Groups
     const groupsResponse: any = await client.request('/api/v2/groups.json?per_page=100');
     const groupMap = new Map<number, GroupMetric>();
 
-    // Initialize every group with 0 data
     groupsResponse.groups.forEach((g: any) => {
         groupMap.set(g.id, {
             id: g.id,
@@ -84,31 +78,44 @@ export const fetchTicketData = async (): Promise<DashboardMetrics> => {
         });
     });
 
-    // 2. Fetch Tickets (Pagination Loop)
+    // 2. Fetch Tickets (Pagination Loop - Max 1000)
     let allTickets: Ticket[] = [];
     let url = '/api/v2/search.json?query=type:ticket status<solved sort:created_at_asc&per_page=100';
     let pages = 0;
 
-    // Safety Cap: Fetch max 10 pages (1000 tickets) to prevent browser freeze. 
-    // Increase 'pages < 10' if you have huge volume.
     while (url && pages < 10) {
         const response: any = await client.request(url);
         allTickets = [...allTickets, ...response.results];
-        url = response.next_page; // Get next page URL
+        url = response.next_page;
         pages++;
     }
 
-    // 3. Fetch Agents
+    // 3. Fetch Agents (With Fallback)
     let agentStats = { online: 0, working: 0 };
+
     try {
+        // Attempt A: Unified Status (Preferred for Online/Offline)
         const agentsResponse: any = await client.request('/api/v2/unified_agent_status');
         if (agentsResponse && agentsResponse.agent_statuses) {
             const allAgents = Object.values(agentsResponse.agent_statuses) as any[];
             agentStats.online = allAgents.filter(a => a.status === 'online').length;
+            // "Working" here means logged in (not offline)
             agentStats.working = allAgents.filter(a => a.status !== 'offline').length;
         }
     } catch (e) {
-        console.warn("Agent API error (Ignore if you don't have Omni-channel):", e);
+        console.warn("Unified Status API failed, trying fallback...", e);
+    }
+
+    // Fallback: If "Working" is still 0 (API failed), fetch Total Active Agents via Search
+    if (agentStats.working === 0) {
+        try {
+            // Search for all active agents/admins not suspended
+            const agentSearch: any = await client.request('/api/v2/search.json?query=type:user role:agent role:admin suspended:false');
+            agentStats.working = agentSearch.count; // This is "Total Staff"
+            // "Online" will remain 0 as we can't guess it without the Status API
+        } catch (err) {
+            console.error("Agent fallback failed", err);
+        }
     }
 
     // --- METRICS ENGINE ---
@@ -123,16 +130,14 @@ export const fetchTicketData = async (): Promise<DashboardMetrics> => {
         breachedWaitCount: 0,
         breachedHandleCount: 0,
         agents: agentStats,
-        groups: [] // Will be filled from map
+        groups: []
     };
 
     allTickets.forEach(t => {
-        // If ticket belongs to a deleted group, skip or add to "Unknown"
         const gId = t.group_id || 0;
         if (!groupMap.has(gId)) return;
 
         const gMetric = groupMap.get(gId)!;
-
         const created = parseISO(t.created_at);
         const updated = parseISO(t.updated_at);
         const waitTime = differenceInMinutes(now, created);
@@ -140,33 +145,33 @@ export const fetchTicketData = async (): Promise<DashboardMetrics> => {
         const channel = t.via.channel;
         const isMessaging = CHANNELS.MESSAGING.includes(channel);
 
-        // --- KPI 1: New & Unassigned ---
-        if (t.status === 'new' && t.assignee_id === null) {
+        // KPI 1: New (All New tickets, regardless of assignment)
+        if (t.status === 'new') {
             metrics.newCount++;
-            gMetric.newTickets++;
+            gMetric.newTickets++; // User request: Count all new
 
-            // Wait Time Calculations
-            if (waitTime > metrics.longestWait.time) metrics.longestWait = { time: waitTime, ticketId: t.id };
+            // Logic: Only calculate "Longest Wait" if Unassigned (Standard RTA rule)
+            if (t.assignee_id === null) {
+                if (waitTime > metrics.longestWait.time) metrics.longestWait = { time: waitTime, ticketId: t.id };
 
-            if (isMessaging) {
-                if (waitTime > gMetric.longestMsgWait) gMetric.longestMsgWait = waitTime;
-            } else {
-                if (waitTime > gMetric.longestEmailWait) gMetric.longestEmailWait = waitTime;
-            }
+                if (isMessaging) {
+                    if (waitTime > gMetric.longestMsgWait) gMetric.longestMsgWait = waitTime;
+                } else {
+                    if (waitTime > gMetric.longestEmailWait) gMetric.longestEmailWait = waitTime;
+                }
 
-            // Breach Check (Wait)
-            if (waitTime > THRESHOLDS.WAIT_TIME_BREACH) {
-                metrics.breachedWaitCount++;
-                gMetric.breachedTickets++;
+                if (waitTime > THRESHOLDS.WAIT_TIME_BREACH) {
+                    metrics.breachedWaitCount++;
+                    gMetric.breachedTickets++;
+                }
             }
         }
 
-        // --- KPI 2: Open (Any Open ticket) ---
+        // KPI 2: Open (All Open tickets)
         if (t.status === 'open') {
             metrics.openCount++;
             gMetric.openTickets++;
 
-            // Handle Time Calculations (Only if assigned usually, but checking all Open)
             if (handleTime > metrics.longestHandle.time) metrics.longestHandle = { time: handleTime, ticketId: t.id };
 
             if (isMessaging) {
@@ -175,21 +180,18 @@ export const fetchTicketData = async (): Promise<DashboardMetrics> => {
                 if (handleTime > gMetric.longestEmailAHT) gMetric.longestEmailAHT = handleTime;
             }
 
-            // Breach Check (Handle)
             if (handleTime > THRESHOLDS.HANDLE_TIME_BREACH) {
                 metrics.breachedHandleCount++;
                 gMetric.breachedTickets++;
             }
         }
 
-        // --- KPI 3: Pending ---
         if (t.status === 'pending') {
             metrics.pendingCount++;
             gMetric.pendingTickets++;
         }
     });
 
-    // Convert Map back to Array
     metrics.groups = Array.from(groupMap.values());
     return metrics;
 };

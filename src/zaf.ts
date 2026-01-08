@@ -14,7 +14,7 @@ if (typeof window.ZAFClient !== 'undefined') {
 export { client };
 
 // src/zaf.ts
-// ... imports and client init ...
+// ... existing imports
 
 export const openModal = () => {
     if (!client) return;
@@ -22,8 +22,8 @@ export const openModal = () => {
         location: 'modal',
         url: 'assets/index.html?mode=modal',
         size: {
-            width: '800px',  // <--- UPDATED
-            height: '900px'  // <--- UPDATED
+            width: '1250px', // <--- Increased Width
+            height: '1100px' // <--- Increased Height
         }
     });
 };
