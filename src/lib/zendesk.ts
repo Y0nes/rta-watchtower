@@ -6,8 +6,13 @@ export const THRESHOLDS = {
     HANDLE_TIME_BREACH: 20
 };
 
+// Full Channel List
 const CHANNELS = {
-    MESSAGING: ['native_messaging', 'chat', 'facebook', 'twitter', 'line', 'whatsapp', 'instagram_direct']
+    MESSAGING: [
+        'messaging', 'native_messaging', 'chat', 'facebook', 'facebook_messenger',
+        'instagram_direct', 'line', 'whatsapp', 'twitter', 'twitter_dm',
+        'sms', 'sunshine_conversations_api', 'any_channel'
+    ]
 };
 
 export interface Ticket {
@@ -15,19 +20,13 @@ export interface Ticket {
     created_at: string; updated_at: string; via: { channel: string; };
 }
 
-export interface AgentStatus { online: number; working: number; }
-
 export interface GroupMetric {
     id: number; name: string;
     longestEmailWait: number; longestMsgWait: number;
     longestEmailAHT: number; longestMsgAHT: number;
     newEmail: number; newMsg: number; openEmail: number; openMsg: number;
     pendingTickets: number;
-
-    // NEW: Split Breaches so we can sum them up for cards
-    breachedWait: number;
-    breachedAHT: number;
-    totalBreached: number; // Sum of both
+    breachedWait: number; breachedAHT: number; totalBreached: number;
 }
 
 export interface DashboardMetrics {
@@ -35,7 +34,8 @@ export interface DashboardMetrics {
     longestHandle: { time: number; ticketId: number };
     totalNew: number; totalOpen: number;
     breachedWaitCount: number; breachedHandleCount: number;
-    agents: AgentStatus; groups: GroupMetric[];
+    groups: GroupMetric[];
+    isCapped: boolean;
 }
 
 export const fetchAllGroups = async () => {
@@ -46,23 +46,34 @@ export const fetchAllGroups = async () => {
     } catch (e) { return []; }
 };
 
-export const fetchTicketData = async (): Promise<DashboardMetrics> => {
+export const fetchTicketData = async (targetGroupIds: number[] = []): Promise<DashboardMetrics> => {
     if (!client) throw new Error("ZAF Client not initialized");
 
+    // 1. Setup Groups
     const allGroups = await fetchAllGroups();
     const groupMap = new Map<number, GroupMetric>();
 
     allGroups.forEach((g: any) => {
+        if (targetGroupIds.length > 0 && !targetGroupIds.includes(g.id)) return;
+
         groupMap.set(g.id, {
             id: g.id, name: g.name,
             longestEmailWait: 0, longestMsgWait: 0, longestEmailAHT: 0, longestMsgAHT: 0,
-            newEmail: 0, newMsg: 0, openEmail: 0, openMsg: 0, pendingTickets: 0,
-            breachedWait: 0, breachedAHT: 0, totalBreached: 0
+            newEmail: 0, newMsg: 0, openEmail: 0, openMsg: 0,
+            pendingTickets: 0, breachedWait: 0, breachedAHT: 0, totalBreached: 0
         });
     });
 
+    // 2. Fetch Tickets
+    let rawQuery = 'type:ticket status<pending';
+    if (targetGroupIds.length > 0) {
+        const groupString = targetGroupIds.map(id => `group_id:${id}`).join(' ');
+        rawQuery += ` ${groupString}`;
+    }
+    rawQuery += ' sort:created_at_asc';
+
     let allTickets: Ticket[] = [];
-    let url = `/api/v2/search.json?query=type:ticket status<solved sort:created_at_asc&per_page=100`;
+    let url = `/api/v2/search.json?query=${encodeURIComponent(rawQuery)}&per_page=100`;
     let pages = 0;
 
     while (url && pages < 50) {
@@ -74,28 +85,15 @@ export const fetchTicketData = async (): Promise<DashboardMetrics> => {
         } catch (e) { break; }
     }
 
-    let agentStats = { online: 0, working: 0 };
-    try {
-        const agentsResponse: any = await client.request('/api/v2/unified_agent_status');
-        if (agentsResponse?.agent_statuses) {
-            const allAgents = Object.values(agentsResponse.agent_statuses) as any[];
-            agentStats.online = allAgents.filter(a => a.status === 'online').length;
-            agentStats.working = allAgents.filter(a => a.status !== 'offline').length;
-        }
-    } catch (e) { }
+    const isCapped = allTickets.length >= 1000;
 
-    if (agentStats.working === 0) {
-        try {
-            const agentSearch: any = await client.request('/api/v2/search.json?query=type:user role:agent suspended:false');
-            agentStats.working = agentSearch.count;
-        } catch (e) { }
-    }
-
+    // 3. Calculate Metrics
     const now = new Date();
     const metrics: DashboardMetrics = {
         longestWait: { time: 0, ticketId: 0 }, longestHandle: { time: 0, ticketId: 0 },
         totalNew: 0, totalOpen: 0, breachedWaitCount: 0, breachedHandleCount: 0,
-        agents: agentStats, groups: []
+        groups: [],
+        isCapped: isCapped
     };
 
     allTickets.forEach(t => {
@@ -118,7 +116,7 @@ export const fetchTicketData = async (): Promise<DashboardMetrics> => {
 
                 if (waitTime > THRESHOLDS.WAIT_TIME_BREACH) {
                     metrics.breachedWaitCount++;
-                    gMetric.breachedWait++; // Track per group
+                    gMetric.breachedWait++;
                     gMetric.totalBreached++;
                 }
             }
@@ -134,12 +132,10 @@ export const fetchTicketData = async (): Promise<DashboardMetrics> => {
 
             if (handleTime > THRESHOLDS.HANDLE_TIME_BREACH) {
                 metrics.breachedHandleCount++;
-                gMetric.breachedAHT++; // Track per group
+                gMetric.breachedAHT++;
                 gMetric.totalBreached++;
             }
         }
-
-        if (t.status === 'pending') gMetric.pendingTickets++;
     });
 
     metrics.groups = Array.from(groupMap.values());

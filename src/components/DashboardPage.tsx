@@ -1,39 +1,26 @@
-import { useEffect, useState, useMemo } from 'react';
-import { RefreshCw, Clock, AlertCircle, CheckCircle, Filter, UserCheck, Users, ArrowUpDown, ArrowUp, ArrowDown, Search } from 'lucide-react';
-import { fetchTicketData, DashboardMetrics, GroupMetric, THRESHOLDS } from '../lib/zendesk';
+import { useEffect, useState, useMemo, useRef } from 'react';
+import { RefreshCw, Clock, AlertCircle, CheckCircle, Filter, ArrowUpDown, ArrowUp, ArrowDown, Search, AlertTriangle } from 'lucide-react';
+import { fetchTicketData, fetchAllGroups, DashboardMetrics, GroupMetric, THRESHOLDS } from '../lib/zendesk';
 import { format } from 'date-fns';
 
-// Enhanced StatCard with Dynamic Color Logic
 const StatCard = ({ title, value, subtext, icon: Icon, type, threshold = 0 }: any) => {
     let colorClass = "text-gray-900";
     let iconColor = "text-gray-400";
     let bgClass = "bg-white border-gray-200";
 
-    // Logic: 
-    // 1. Time based: Green if low, Red if high
-    // 2. Breach count: Green if 0, Red if > 0
-
     if (type === 'time') {
-        const numValue = parseInt(value); // assume "45 min" string
+        const numValue = parseInt(value);
         if (numValue > threshold) {
-            colorClass = "text-red-600";
-            iconColor = "text-red-500";
-            bgClass = "bg-red-50 border-red-200";
+            colorClass = "text-red-600"; iconColor = "text-red-500"; bgClass = "bg-red-50 border-red-200";
         } else if (numValue > 0) {
-            colorClass = "text-green-600";
-            iconColor = "text-green-500";
-            bgClass = "bg-green-50 border-green-200";
+            colorClass = "text-green-600"; iconColor = "text-green-500"; bgClass = "bg-green-50 border-green-200";
         }
     }
     else if (type === 'breach') {
         if (value > 0) {
-            colorClass = "text-red-600";
-            iconColor = "text-red-500";
-            bgClass = "bg-red-50 border-red-200";
+            colorClass = "text-red-600"; iconColor = "text-red-500"; bgClass = "bg-red-50 border-red-200";
         } else {
-            colorClass = "text-green-600";
-            iconColor = "text-green-500";
-            bgClass = "bg-green-50 border-green-200";
+            colorClass = "text-green-600"; iconColor = "text-green-500"; bgClass = "bg-green-50 border-green-200";
         }
     }
 
@@ -55,22 +42,38 @@ export const DashboardPage = () => {
     const [rawData, setRawData] = useState<DashboardMetrics | null>(null);
     const [loading, setLoading] = useState(true);
     const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+    const [allGroupsList, setAllGroupsList] = useState<any[]>([]);
+
     const [selectedGroupIds, setSelectedGroupIds] = useState<Set<number>>(() => {
         const saved = localStorage.getItem('rta_filter_groups');
         return saved ? new Set(JSON.parse(saved)) : new Set();
     });
+
+    const selectedGroupIdsRef = useRef(selectedGroupIds);
+
     const [isFilterOpen, setIsFilterOpen] = useState(false);
     const [filterSearch, setFilterSearch] = useState("");
     const [sortConfig, setSortConfig] = useState<{ key: keyof GroupMetric; direction: 'asc' | 'desc' } | null>(null);
 
+    useEffect(() => {
+        selectedGroupIdsRef.current = selectedGroupIds;
+        localStorage.setItem('rta_filter_groups', JSON.stringify(Array.from(selectedGroupIds)));
+    }, [selectedGroupIds]);
+
+    useEffect(() => {
+        fetchAllGroups().then(groups => {
+            setAllGroupsList(groups);
+        });
+    }, []);
+
     const loadData = async () => {
         setLoading(true);
         try {
-            const metrics = await fetchTicketData();
+            const currentSelection = selectedGroupIdsRef.current;
+            const targetIds = currentSelection.size > 0 ? Array.from(currentSelection) : [];
+
+            const metrics = await fetchTicketData(targetIds);
             setRawData(metrics);
-            if (localStorage.getItem('rta_filter_groups') === null && metrics.groups.length > 0) {
-                setSelectedGroupIds(new Set(metrics.groups.map(g => g.id)));
-            }
             setLastUpdated(new Date());
         } catch (error) { console.error("Load failed", error); }
         finally { setLoading(false); }
@@ -78,18 +81,15 @@ export const DashboardPage = () => {
 
     useEffect(() => {
         loadData();
-        const interval = setInterval(loadData, 60000);
+        const interval = setInterval(() => {
+            loadData();
+        }, 60000);
         return () => clearInterval(interval);
     }, []);
 
-    useEffect(() => {
-        if (rawData) localStorage.setItem('rta_filter_groups', JSON.stringify(Array.from(selectedGroupIds)));
-    }, [selectedGroupIds, rawData]);
-
-    // --- Dynamic Calculations based on Filter ---
     const processedData = useMemo(() => {
         if (!rawData) return null;
-        let activeGroups = rawData.groups.filter(g => selectedGroupIds.has(g.id));
+        let activeGroups = rawData.groups;
 
         if (sortConfig) {
             activeGroups = [...activeGroups].sort((a, b) => {
@@ -105,18 +105,14 @@ export const DashboardPage = () => {
         return {
             ...rawData,
             groups: activeGroups,
-            // Recalculate Totals based on filtered groups
             totalNew: activeGroups.reduce((acc, g) => acc + g.newEmail + g.newMsg, 0),
             totalOpen: activeGroups.reduce((acc, g) => acc + g.openEmail + g.openMsg, 0),
-
             longestWait: { time: Math.max(...activeGroups.map(g => Math.max(g.longestEmailWait, g.longestMsgWait)), 0), ticketId: 0 },
             longestHandle: { time: Math.max(...activeGroups.map(g => Math.max(g.longestEmailAHT, g.longestMsgAHT)), 0), ticketId: 0 },
-
-            // FIXED: Sum breaches from active groups
             breachedWaitCount: activeGroups.reduce((acc, g) => acc + g.breachedWait, 0),
             breachedHandleCount: activeGroups.reduce((acc, g) => acc + g.breachedAHT, 0),
         };
-    }, [rawData, selectedGroupIds, sortConfig]);
+    }, [rawData, sortConfig]);
 
     const handleSort = (key: keyof GroupMetric) => {
         let direction: 'asc' | 'desc' = 'desc';
@@ -131,9 +127,7 @@ export const DashboardPage = () => {
     };
 
     const toggleAll = () => {
-        if (!rawData) return;
-        if (selectedGroupIds.size === rawData.groups.length) setSelectedGroupIds(new Set());
-        else setSelectedGroupIds(new Set(rawData.groups.map(g => g.id)));
+        if (selectedGroupIds.size > 0) setSelectedGroupIds(new Set());
     };
 
     const SortIcon = ({ column }: { column: keyof GroupMetric }) => {
@@ -141,7 +135,7 @@ export const DashboardPage = () => {
         return sortConfig.direction === 'asc' ? <ArrowUp className="w-3 h-3 text-blue-600 ml-1 inline" /> : <ArrowDown className="w-3 h-3 text-blue-600 ml-1 inline" />;
     };
 
-    const filteredDropdownList = rawData?.groups
+    const filteredDropdownList = allGroupsList
         .filter(g => g.name.toLowerCase().includes(filterSearch.toLowerCase()))
         .sort((a, b) => a.name.localeCompare(b.name));
 
@@ -155,42 +149,57 @@ export const DashboardPage = () => {
                     {lastUpdated && <p className="text-xs text-gray-500 mt-1">Updated: {format(lastUpdated, 'h:mm:ss a')}</p>}
                 </div>
 
-                <div className="flex gap-3">
+                <div className="flex gap-3 items-center">
+                    {rawData?.isCapped && selectedGroupIds.size === 0 && (
+                        <div className="flex items-center gap-2 px-3 py-1 bg-yellow-100 text-yellow-800 rounded-lg text-xs font-bold">
+                            <AlertTriangle className="w-4 h-4" />
+                            Global View Capped (1000). Select Groups.
+                        </div>
+                    )}
+
                     <div className="relative">
                         <button onClick={() => setIsFilterOpen(!isFilterOpen)} className="flex items-center gap-2 px-4 py-2 bg-white border border-gray-300 rounded-lg text-sm font-medium hover:bg-gray-50">
-                            <Filter className="w-4 h-4" /> Filter Groups ({selectedGroupIds.size})
+                            <Filter className="w-4 h-4" />
+                            {selectedGroupIds.size === 0 ? "Global View" : `Filtering ${selectedGroupIds.size} Groups`}
                         </button>
 
                         {isFilterOpen && (
                             <div className="absolute right-0 mt-2 w-80 bg-white border border-gray-200 rounded-xl shadow-lg z-50 p-3">
+                                <div className="text-xs text-gray-400 mb-2">
+                                    Select specific groups to bypass the 1000 ticket limit.
+                                    <br />Click <b>Refresh</b> after selecting.
+                                </div>
                                 <div className="relative mb-2">
                                     <Search className="absolute left-2 top-2.5 w-4 h-4 text-gray-400" />
-                                    <input type="text" placeholder="Search..." className="w-full pl-8 pr-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" value={filterSearch} onChange={(e) => setFilterSearch(e.target.value)} />
+                                    <input type="text" placeholder="Search groups..." className="w-full pl-8 pr-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" value={filterSearch} onChange={(e) => setFilterSearch(e.target.value)} />
                                 </div>
+
                                 <div className="flex justify-between items-center mb-2 px-1">
-                                    <button onClick={toggleAll} className="text-xs font-bold text-blue-600 hover:text-blue-800">{selectedGroupIds.size === rawData?.groups.length ? 'Uncheck All' : 'Check All'}</button>
-                                    <span className="text-xs text-gray-400">{filteredDropdownList?.length} groups</span>
+                                    <button onClick={toggleAll} className="text-xs font-bold text-blue-600 hover:text-blue-800">Clear Selection (Show Global)</button>
                                 </div>
+
                                 <div className="max-h-80 overflow-y-auto space-y-1">
-                                    {filteredDropdownList?.map(g => (
+                                    {filteredDropdownList.map(g => (
                                         <label key={g.id} className="flex items-center gap-2 px-2 py-1.5 hover:bg-gray-50 rounded cursor-pointer">
                                             <input type="checkbox" checked={selectedGroupIds.has(g.id)} onChange={() => toggleGroup(g.id)} className="rounded border-gray-300 text-blue-600 focus:ring-blue-500" />
                                             <span className="text-sm text-gray-700 truncate">{g.name}</span>
                                         </label>
                                     ))}
+                                    {filteredDropdownList.length === 0 && <div className="p-2 text-xs text-gray-400 text-center">Loading groups...</div>}
                                 </div>
                             </div>
                         )}
                         {isFilterOpen && <div className="fixed inset-0 z-40" onClick={() => setIsFilterOpen(false)} />}
                     </div>
+
                     <button onClick={loadData} className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700">
-                        <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} /> Refresh
+                        <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} /> Refresh Data
                     </button>
                 </div>
             </div>
 
-            {/* CARDS */}
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+            {/* SINGLE ROW OF CARDS (Grid Cols 6) */}
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 mb-8">
                 <StatCard
                     title="Longest Wait"
                     value={`${processedData?.longestWait.time} min`}
@@ -209,11 +218,7 @@ export const DashboardPage = () => {
                 />
                 <StatCard title="New Tickets" value={processedData?.totalNew} subtext="Total New" icon={AlertCircle} />
                 <StatCard title="Open Tickets" value={processedData?.totalOpen} subtext="Total Open" icon={CheckCircle} />
-            </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
-                <StatCard title="Agents Online" value={rawData?.agents.online} subtext="Status: Online" icon={UserCheck} />
-                <StatCard title="Total Staff" value={rawData?.agents.working} subtext="Active / Working" icon={Users} />
                 <StatCard
                     title="Wait Breach"
                     value={processedData?.breachedWaitCount}
@@ -230,7 +235,7 @@ export const DashboardPage = () => {
                 />
             </div>
 
-            {/* TABLE - Centered & Cleaned */}
+            {/* TABLE */}
             <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
                 <div className="overflow-x-auto">
                     <table className="w-full text-sm text-center whitespace-nowrap">
